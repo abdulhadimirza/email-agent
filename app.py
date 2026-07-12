@@ -3,9 +3,38 @@ import asyncio
 import chainlit as cl
 from dotenv import load_dotenv
 from crew import create_crew  # Local import of the crew setup
+from crewai.agents.parser import AgentAction, AgentFinish
 
 # Load environment variables
 load_dotenv()
+
+def make_step_callback(agent_role: str):
+    """Factory to create step callbacks that bridge to the Chainlit UI."""
+    def step_callback(step_output):
+        if isinstance(step_output, AgentAction):
+            step_name = f"🤖 {agent_role} (Tool: {step_output.tool})"
+            content = f"**Thought:** {step_output.thought}\n\n**Tool Input:** `{step_output.tool_input}`"
+            if step_output.result:
+                # Truncate tool results if they are excessively long for UI display
+                res_str = str(step_output.result)
+                if len(res_str) > 2000:
+                    res_str = res_str[:2000] + "\n\n...(truncated for display)..."
+                content += f"\n\n**Tool Output:**\n```markdown\n{res_str}\n```"
+        elif isinstance(step_output, AgentFinish):
+            step_name = f"🏁 {agent_role} (Finished)"
+            content = f"**Thought:** {step_output.thought}\n\n**Final Answer draft:**\n{step_output.output}"
+        else:
+            step_name = f"⚙️ {agent_role} (Step)"
+            content = str(step_output)
+
+        def update_ui():
+            step = cl.Step(name=step_name, type="run")
+            step.output = content
+            return step.send()
+
+        cl.run_sync(update_ui())
+    
+    return step_callback
 
 @cl.on_chat_start
 async def on_chat_start():
@@ -22,7 +51,7 @@ async def on_chat_start():
         # Welcome message
         await cl.Message(
             content="🚀 **Chainlit + CrewAI Chatbot Initialized!**\n\n"
-                    "Start chatting with the Llama 8b-powered conversational assistant below."
+                    "Start chatting with the Multi-Agent, Tool-enabled assistant below."
         ).send()
 
 @cl.on_message
@@ -39,8 +68,8 @@ async def on_message(message: cl.Message):
     await status_msg.send()
 
     try:
-        # Create the crew with the user's input
-        crew = create_crew(message.content)
+        # Create the crew with the user's input and step callback creator
+        crew = create_crew(message.content, step_callback_creator=make_step_callback)
         
         # Execute the crew synchronously in a separate thread to keep the UI responsive
         result = await asyncio.to_thread(crew.kickoff)
@@ -51,3 +80,4 @@ async def on_message(message: cl.Message):
         ).send()
     except Exception as e:
         await cl.Message(content=f"❌ **An error occurred:** {str(e)}").send()
+

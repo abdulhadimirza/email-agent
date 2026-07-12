@@ -4,3 +4,6 @@
 [submodule "chainlit"]
 	path = chainlit
 	url = https://github.com/Chainlit/chainlit.git
+[submodule "ddgs"]
+	path = ddgs
+	url = https://github.com/deedy5/ddgs.git
