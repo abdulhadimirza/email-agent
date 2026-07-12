@@ -1,8 +1,12 @@
 import os
+import time
 from dotenv import load_dotenv
-from crewai import Agent, Task, Crew, Process, LLM
-from crewai.tools import tool
+from pydantic import BaseModel
+from crewai import Agent, LLM
+from crewai.flow.flow import Flow, listen, start
 from ddgs import DDGS
+
+import re
 
 # Workaround for CrewAI injecting cache_breakpoint on unsupported models
 try:
@@ -14,101 +18,244 @@ except ImportError:
 # Load environment variables
 load_dotenv()
 
-@tool("Web Search")
-def web_search(query: str) -> str:
-    """Search the web for a query and return titles and URLs of top results."""
-    try:
-        with DDGS() as ddgs:
-            # Set backend to 'brave' (verified to be robust and captcha-free)
-            results = ddgs.text(query, max_results=10, backend="brave")
-            output = []
-            for r in results:
-                # ddgs uses 'href' for the URL field
-                url = r.get('href') or r.get('url') or 'No URL'
-                output.append(f"Title: {r.get('title')}\nURL: {url}\n---")
-            return "\n".join(output) if output else "No results found."
-    except Exception as e:
-        return f"Search error: {str(e)}"
-
-def create_crew(user_query: str, step_callback_creator=None) -> Crew:
-    # Initialize the LLM using Groq (defaulting to Llama 8b)
-    groq_llm = LLM(
-        model=os.environ.get("MODEL", "groq/llama3-8b-8192"),
-        api_key=os.environ.get("GROQ_API_KEY"),
-        additional_params={
-            "parallel_tool_calls": False, # Prevent parallel tool hallucinations
-            "num_retries": 5              # Auto-retry with backoff on rate limits
-        }
-    )
-
-    # Scoped tool to programmatically enforce only one website scrape per execution
-    scraped_urls = set()
-
-    @tool("Scrape Website")
-    def scrape_website(url: str) -> str:
-        """Fetch the text content of a specific website URL to get more detail.
-        You can ONLY call this tool ONCE. Select the single most relevant URL from your search results.
-        Do NOT call this tool multiple times.
-        """
-        if len(scraped_urls) >= 1:
-            return "Error: You are only allowed to scrape ONE website. You have already scraped a website. Please compile your report using the information you already gathered."
+def clean_markdown(text: str) -> str:
+    """Strip navigation bars, footer link definitions, and tag/post lists from scraped markdown."""
+    # 1. Remove link reference definitions at the end (e.g. [1]: http://...)
+    text = re.sub(r'^\[\d+\]:\s+\S+', '', text, flags=re.MULTILINE)
+    
+    # 2. Filter lines that are navigation blocks or isolated lists of links
+    cleaned_lines = []
+    lines = text.split('\n')
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            cleaned_lines.append("")
+            continue
+        
+        # Skip pure list items containing only a markdown link (e.g. "* [ All posts ][6]")
+        if re.match(r'^[\*\-\+\d\.]?\s*\[[^\]]+\]\s*(?:\[\d+\]|\([^\)]+\))\s*$', stripped):
+            continue
             
+        # Skip lines that are mostly links and short (heuristics for navigation bars/tag clouds)
+        links_count = len(re.findall(r'\[[^\]]+\]\s*(?:\[\d+\]|\([^\)]+\))', stripped))
+        if links_count > 0 and links_count * 15 >= len(stripped):
+            continue
+            
+        cleaned_lines.append(line)
+        
+    result = '\n'.join(cleaned_lines)
+    result = re.sub(r'\n{3,}', '\n\n', result)
+    return result.strip()
+
+def is_junk_paragraph(p: str) -> bool:
+    """Check if a paragraph is likely junk (navigation, tracking links, redirects)."""
+    p_lower = p.lower()
+    # Check for URL query parameter / redirect noise
+    if "%2f" in p_lower or "%3a" in p_lower or "redirect=" in p_lower or "source=post_page" in p_lower:
+        return True
+    # Check for extremely long tokens (e.g. tracking parameters or base64 data)
+    words = p.split()
+    if words:
+        max_len = max(len(w) for w in words)
+        if max_len > 55:
+            return True
+    # Check if the paragraph consists only of references, brackets, digits, list markers
+    stripped = p.strip()
+    if re.match(r'^[\]\[\s\d\-\+\*]*$', stripped):
+        return True
+    return False
+
+def extract_relevant_content(text: str, query: str, max_chars: int = 1500) -> str:
+    """Extracts the most relevant chunks of text based on the query."""
+    if not text:
+        return ""
+        
+    query_words = set(w for w in re.findall(r'\w+', query.lower()) if len(w) > 1)
+    if not query_words:
+        return text[:max_chars]
+
+    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
+    
+    scored_paragraphs = []
+    for i, p in enumerate(paragraphs):
+        if is_junk_paragraph(p):
+            continue
+            
+        # Strip URLs and link markdown targets for scoring, so we only score the text itself
+        p_clean = re.sub(r'https?://\S+', '', p.lower())
+        p_clean = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', p_clean)
+        p_clean = re.sub(r'\[([^\]]+)\]\[[^\]]*\]', r'\1', p_clean)
+        
+        p_words = set(re.findall(r'\w+', p_clean))
+        overlap = query_words.intersection(p_words)
+        
+        score = len(overlap)
+        # Give a small boost to headings containing query keywords
+        if p.startswith('#') and score > 0:
+            score *= 1.5
+            
+        # -i ensures that earlier paragraphs are favored on a tie
+        scored_paragraphs.append((score, -i, p))
+    
+    # Sort by score descending, then by position (ascending original order)
+    scored_paragraphs.sort(reverse=True)
+    
+    selected_paragraphs = []
+    current_length = 0
+    for score, neg_i, p in scored_paragraphs:
+        if score == 0 and current_length > 0:
+            continue
+            
+        if current_length + len(p) <= max_chars:
+            selected_paragraphs.append((neg_i, p))
+            current_length += len(p) + 2 # +2 for \n\n
+        elif current_length < max_chars / 2: 
+            remaining = max_chars - current_length
+            if '|' in p: # Try to truncate tables nicely by line
+                lines = p.split('\n')
+                table_lines = []
+                table_len = 0
+                for line in lines:
+                    if table_len + len(line) + 1 <= remaining:
+                        table_lines.append(line)
+                        table_len += len(line) + 1
+                    else:
+                        break
+                if table_lines:
+                    selected_paragraphs.append((neg_i, '\n'.join(table_lines)))
+                    current_length += table_len + 2
+            else:
+                selected_paragraphs.append((neg_i, p[:remaining] + "..."))
+            break
+        else:
+            break
+            
+    # Sort back to original order
+    selected_paragraphs.sort(reverse=True)
+    
+    return "\n\n".join(p for _, p in selected_paragraphs)
+
+class ResearchState(BaseModel):
+    query: str = ""
+    urls: list[str] = []
+    scraped_data: list[str] = []
+    report: str = ""
+
+class ResearchFlow(Flow[ResearchState]):
+    step_callback_creator = None
+    status_callback = None
+
+    def log_status(self, message: str):
+        if self.status_callback:
+            self.status_callback(message)
+        print(f"[Flow Status] {message}")
+
+    def extract_search_query(self) -> str:
+        self.log_status("Formulating search query...")
+        groq_llm = LLM(
+            model=os.environ.get("MODEL", "groq/llama3-8b-8192"),
+            api_key=os.environ.get("GROQ_API_KEY")
+        )
+        prompt = (
+            f"You are a search query optimizer. Extract the core search keywords from this user request. "
+            f"Output ONLY the optimized search query string (maximum 10 words), with no quotes or preamble.\n\n"
+            f"User Request: {self.state.query}"
+        )
         try:
-            # Strip trailing punctuation the LLM might append
-            url = url.strip().rstrip(')').rstrip('.')
-            with DDGS() as ddgs:
-                res = ddgs.extract(url, fmt="text_markdown")
-                scraped_urls.add(url)
-                return res.get("content", "")[:3000]
+            res = groq_llm.call(prompt)
+            clean_q = res.strip().replace('"', '').replace("'", "")
+            return clean_q
         except Exception as e:
-            return f"Scraping error: {str(e)}"
+            self.log_status(f"Failed to optimize query: {e}. Using raw query.")
+            return self.state.query[:100]
 
-    # Get callbacks if provided
-    researcher_callback = step_callback_creator("Senior Researcher") if step_callback_creator else None
-    writer_callback = step_callback_creator("Technical Writer") if step_callback_creator else None
+    @start()
+    def gather_urls(self):
+        search_query = self.extract_search_query()
+        self.log_status(f"Searching the web for: '{search_query}'")
+        results = []
+        try:
+            with DDGS() as ddgs:
+                try:
+                    results = ddgs.text(search_query, max_results=3, backend="brave")
+                except Exception as e:
+                    self.log_status("Brave search backend failed (Rate Limited/429). Falling back to default backend...")
+                
+                if not results:
+                    results = ddgs.text(search_query, max_results=3, backend="auto")
+                
+                self.state.urls = [r.get('href') or r.get('url') for r in results if r.get('href') or r.get('url')]
+                self.log_status(f"Found {len(self.state.urls)} URLs to scrape.")
+        except Exception as e:
+            self.state.urls = []
+            self.log_status(f"Search error: {e}")
 
-    # Define a researcher agent
-    researcher = Agent(
-        role="Senior Researcher",
-        goal="Search the web and select the single most relevant URL for the topic.",
-        backstory="You are an expert researcher. Your sole job is to use 'Web Search' to find information, evaluate the titles and URLs, select the SINGLE most promising URL to answer the query, and hand it off to the writer. You do not scrape.",
-        verbose=True,
-        llm=groq_llm,
-        tools=[web_search],
-        step_callback=researcher_callback
-    )
+    @listen(gather_urls)
+    def scrape_websites(self):
+        self.state.scraped_data = []
+        for url in self.state.urls:
+            self.log_status(f"Scraping URL: {url}")
+            try:
+                # Strip trailing punctuation the LLM might append (though here we got it programmatically)
+                url = url.strip().rstrip(')').rstrip('.')
+                with DDGS() as ddgs:
+                    res = ddgs.extract(url, fmt="text_markdown")
+                    content = res.get("content", "")
+                    
+                    # Instead of truncating just at the start, extract relevant paragraphs
+                    if content:
+                        cleaned_content = clean_markdown(content)
+                        truncated = extract_relevant_content(cleaned_content, self.state.query, max_chars=1500)
+                        scraped_entry = f"URL: {url}\nContent Snippet:\n{truncated}\n---"
+                        self.state.scraped_data.append(scraped_entry)
+                        print(f"\n=== SCRAPED DATA FROM {url} ===\n{truncated}\n================================\n")
+                    
+                    # Add a small delay to avoid DDGS rate limits
+                    time.sleep(1.5)
+            except Exception as e:
+                self.log_status(f"Scrape error for {url}: {e}")
 
-    # Define a writer agent
-    writer = Agent(
-        role="Technical Writer",
-        goal="Scrape the selected website and write a comprehensive, beautifully structured markdown report.",
-        backstory="You are a professional technical writer and analyst. You take the URL provided by the researcher, use 'Scrape Website' to fetch its content, read it, and synthesize it into clear, well-structured, and readable markdown documentation.",
-        verbose=True,
-        llm=groq_llm,
-        tools=[scrape_website],
-        step_callback=writer_callback
-    )
+    @listen(scrape_websites)
+    def synthesize_report(self):
+        self.log_status("Synthesizing final report...")
+        groq_llm = LLM(
+            model=os.environ.get("MODEL", "llama-3.1-8b-instant"),
+            api_key=os.environ.get("GROQ_API_KEY"),
+            additional_params={
+                "parallel_tool_calls": False,
+                "num_retries": 5
+            }
+        )
 
-    # Define tasks
-    research_task = Task(
-        description=f"Find the single most relevant URL for the query: {user_query}. Use 'Web Search' to search the internet, look at the titles and URLs, select the single best URL, and output that URL.",
-        expected_output="The single most relevant URL as a plain string.",
-        agent=researcher,
-    )
+        writer_callback = self.step_callback_creator("Technical Writer") if self.step_callback_creator else None
 
-    write_task = Task(
-        description=f"Take the URL provided by the Researcher. Use 'Scrape Website' to fetch the text content of that URL, read it, and compile it into a comprehensive, beautifully structured markdown report answering the user's original query: {user_query}.",
-        expected_output="A final, polished markdown response answering the user's query.",
-        agent=writer,
-    )
+        writer = Agent(
+            role="Technical Writer",
+            goal="Synthesize the provided research data into a comprehensive, beautifully structured markdown report.",
+            backstory="You are a professional technical writer and analyst. You synthesize raw research into clear, well-structured, and readable markdown documentation.",
+            verbose=True,
+            llm=groq_llm,
+            max_rpm=10, 
+            respect_context_window=True,
+            step_callback=writer_callback
+        )
 
-    # Assemble the crew
-    crew = Crew(
-        agents=[researcher, writer],
-        tasks=[research_task, write_task],
-        process=Process.sequential,
-        verbose=True,
-    )
+        combined_data = "\n\n".join(self.state.scraped_data)
+        if not combined_data:
+            combined_data = "No data could be retrieved from the web."
 
-    return crew
+        prompt = (
+            f"Please write a comprehensive, beautifully structured markdown report answering the user's original query: '{self.state.query}'.\n\n"
+            f"Here is the research data gathered from multiple websites:\n\n{combined_data}"
+        )
 
+        result = writer.kickoff(prompt)
+        self.state.report = result.raw
+        return self.state.report
+
+def create_flow(user_query: str, step_callback_creator=None, status_callback=None) -> ResearchFlow:
+    flow = ResearchFlow()
+    flow.state.query = user_query
+    flow.step_callback_creator = step_callback_creator
+    flow.status_callback = status_callback
+    return flow

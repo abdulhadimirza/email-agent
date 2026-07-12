@@ -2,7 +2,7 @@ import os
 import asyncio
 import chainlit as cl
 from dotenv import load_dotenv
-from crew import create_crew  # Local import of the crew setup
+from crew import create_flow  # Local import of the flow setup
 from crewai.agents.parser import AgentAction, AgentFinish
 
 # Load environment variables
@@ -36,6 +36,16 @@ def make_step_callback(agent_role: str):
     
     return step_callback
 
+def make_status_callback():
+    """Factory to create status callbacks for the Flow steps."""
+    def status_callback(msg: str):
+        def update_ui():
+            step = cl.Step(name="⚙️ System Status", type="run")
+            step.output = msg
+            return step.send()
+        cl.run_sync(update_ui())
+    return status_callback
+
 @cl.on_chat_start
 async def on_chat_start():
     # Check if GROQ_API_KEY is configured
@@ -45,7 +55,7 @@ async def on_chat_start():
         await cl.Message(
             content="⚠️ **GROQ_API_KEY is not set!**\n\n"
                     "Please create a `.env` file in the root of the project (you can copy `.env.example`) "
-                    "and set your `GROQ_API_KEY` before starting the crew."
+                    "and set your `GROQ_API_KEY` before starting the flow."
         ).send()
     else:
         # Welcome message
@@ -68,16 +78,19 @@ async def on_message(message: cl.Message):
     await status_msg.send()
 
     try:
-        # Create the crew with the user's input and step callback creator
-        crew = create_crew(message.content, step_callback_creator=make_step_callback)
+        # Create the flow with the user's input and callbacks
+        flow = create_flow(
+            user_query=message.content, 
+            step_callback_creator=make_step_callback,
+            status_callback=make_status_callback()
+        )
         
-        # Execute the crew synchronously in a separate thread to keep the UI responsive
-        result = await asyncio.to_thread(crew.kickoff)
+        # Execute the flow synchronously in a separate thread to keep the UI responsive
+        result = await asyncio.to_thread(flow.kickoff)
         
         # Send the final response back to the UI
         await cl.Message(
-            content=f"{result.raw}"
+            content=f"{result}"
         ).send()
     except Exception as e:
         await cl.Message(content=f"❌ **An error occurred:** {str(e)}").send()
-
