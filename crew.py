@@ -18,6 +18,10 @@ except ImportError:
 # Load environment variables
 load_dotenv()
 
+# Initialize the embedder once so we don't load the model on every function call
+from sentence_transformers import SentenceTransformer, util
+embedder = SentenceTransformer('all-MiniLM-L6-v2')
+
 def clean_markdown(text: str) -> str:
     """Strip navigation bars, footer link definitions, and tag/post lists from scraped markdown."""
     # 1. Remove link reference definitions at the end (e.g. [1]: http://...)
@@ -66,36 +70,45 @@ def is_junk_paragraph(p: str) -> bool:
     return False
 
 def extract_relevant_content(text: str, query: str, max_chars: int = 1500) -> str:
-    """Extracts the most relevant chunks of text based on the query."""
+    """Extracts the most relevant chunks of text based on the query using Semantic Search."""
     if not text:
         return ""
         
-    query_words = set(w for w in re.findall(r'\w+', query.lower()) if len(w) > 1)
-    if not query_words:
+    if not query.strip():
         return text[:max_chars]
 
     paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
     
-    scored_paragraphs = []
+    valid_paragraphs = []
+    valid_indices = []
     for i, p in enumerate(paragraphs):
         if is_junk_paragraph(p):
             continue
-            
-        # Strip URLs and link markdown targets for scoring, so we only score the text itself
-        p_clean = re.sub(r'https?://\S+', '', p.lower())
-        p_clean = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', p_clean)
-        p_clean = re.sub(r'\[([^\]]+)\]\[[^\]]*\]', r'\1', p_clean)
+        valid_paragraphs.append(p)
+        valid_indices.append(i)
         
-        p_words = set(re.findall(r'\w+', p_clean))
-        overlap = query_words.intersection(p_words)
+    if not valid_paragraphs:
+        return ""
         
-        score = len(overlap)
-        # Give a small boost to headings containing query keywords
+    # Compute embeddings
+    query_embedding = embedder.encode(query, convert_to_tensor=True)
+    paragraph_embeddings = embedder.encode(valid_paragraphs, convert_to_tensor=True)
+    
+    # Compute cosine similarities
+    cosine_scores = util.cos_sim(query_embedding, paragraph_embeddings)[0]
+    
+    scored_paragraphs = []
+    for idx, score_tensor in enumerate(cosine_scores):
+        score = score_tensor.item()
+        p = valid_paragraphs[idx]
+        original_idx = valid_indices[idx]
+        
+        # Give a small boost to headings
         if p.startswith('#') and score > 0:
-            score *= 1.5
+            score *= 1.2
             
-        # -i ensures that earlier paragraphs are favored on a tie
-        scored_paragraphs.append((score, -i, p))
+        # -original_idx ensures that earlier paragraphs are favored on a tie
+        scored_paragraphs.append((score, -original_idx, p))
     
     # Sort by score descending, then by position (ascending original order)
     scored_paragraphs.sort(reverse=True)

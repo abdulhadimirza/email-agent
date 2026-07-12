@@ -9,4 +9,5 @@ dependencies = [
     "crewai[litellm]>=1.15.2",
     "ddgs>=9.14.4",
     "python-dotenv>=1.2.2",
+    "sentence-transformers>=5.6.0",
 ]
