@@ -2,7 +2,7 @@ import os
 import asyncio
 import chainlit as cl
 from dotenv import load_dotenv
-from crew import create_flow  # Local import of the flow setup
+from src.crew import create_flow  # Local import of the flow setup
 from crewai.agents.parser import AgentAction, AgentFinish
 
 # Load environment variables
