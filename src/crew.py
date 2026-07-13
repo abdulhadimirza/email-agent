@@ -56,7 +56,7 @@ class ResearchFlow(Flow[ResearchState]):
         try:
             with DDGS() as ddgs:
                 try:
-                    # 1. Increase Search Yield
+                    # Increase Search Yield
                     results = list(ddgs.text(search_query, max_results=20, backend="auto"))
                 except Exception as e:
                     self.log_status(f"DDGS search with auto backend failed: {e}")
@@ -66,7 +66,7 @@ class ResearchFlow(Flow[ResearchState]):
                     self.log_status("No URLs found from search.")
                     return
 
-                # 2. Data Formatting
+                # Data Formatting
                 formatted_results = []
                 for i, r in enumerate(results):
                     url = r.get('href') or r.get('url')
@@ -77,7 +77,7 @@ class ResearchFlow(Flow[ResearchState]):
                 results_str = "\n\n".join(formatted_results)
                 self.log_status(f"Fetched {len(results)} results, curating top 5 with LLM...")
 
-                # 3. LLM Curation (8B Model)
+                # LLM Curation (8B Model)
                 groq_llm = get_groq_llm(model="groq/llama-3.1-8b-instant")
                 prompt = (
                     f"You are an expert researcher evaluating search results for a user's query.\n"
@@ -91,7 +91,7 @@ class ResearchFlow(Flow[ResearchState]):
 
                 try:
                     res = groq_llm.call(prompt, response_model=URLCuration)
-                    # 4. State Update
+                    # State Update
                     import json
                     data = json.loads(res)
                     indices = data.get("selected_indices", [])

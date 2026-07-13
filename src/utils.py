@@ -8,49 +8,27 @@ from fastembed.rerank.cross_encoder import TextCrossEncoder
 
 # Initialize the embedder and reranker once so we don't load the models on every function call
 embedder = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
-try:
-    reranker = TextCrossEncoder(model_name="Xenova/ms-marco-MiniLM-L-6-v2")
-except Exception as e:
-    print(f"Warning: Failed to load cross-encoder: {e}. Falling back to Bi-Encoder only.")
-    reranker = None
+reranker = TextCrossEncoder(model_name="Xenova/ms-marco-MiniLM-L-6-v2")
 
 def get_token_count(text: str, model: str = "cl100k_base") -> int:
     """Returns the number of tokens in a text string."""
-    try:
-        encoding = tiktoken.get_encoding(model)
-        return len(encoding.encode(text, disallowed_special=()))
-    except Exception:
-        # Fallback if tiktoken is not available
-        return len(text) // 4
+    encoding = tiktoken.get_encoding(model)
+    return len(encoding.encode(text, disallowed_special=()))
 
 def chunk_text_by_tokens(text: str, chunk_tokens: int = 200, overlap_tokens: int = 40) -> list[tuple[int, str]]:
     """Splits text into chunks of specified token sizes with overlap. Returns list of (index, chunk)."""
-    try:
-        encoding = tiktoken.get_encoding("cl100k_base")
-        tokens = encoding.encode(text, disallowed_special=())
-        chunks = []
-        i = 0
-        idx = 0
-        while i < len(tokens):
-            chunk = encoding.decode(tokens[i:i + chunk_tokens])
-            if chunk.strip():
-                chunks.append((idx, chunk.strip()))
-                idx += 1
-            i += chunk_tokens - overlap_tokens
-        return chunks
-    except Exception:
-        # Fallback if tiktoken is not available
-        words = text.split()
-        chunks = []
-        i = 0
-        idx = 0
-        while i < len(words):
-            chunk = " ".join(words[i:i + (chunk_tokens)])
-            if chunk.strip():
-                chunks.append((idx, chunk.strip()))
-                idx += 1
-            i += chunk_tokens - overlap_tokens
-        return chunks
+    encoding = tiktoken.get_encoding("cl100k_base")
+    tokens = encoding.encode(text, disallowed_special=())
+    chunks = []
+    i = 0
+    idx = 0
+    while i < len(tokens):
+        chunk = encoding.decode(tokens[i:i + chunk_tokens])
+        if chunk.strip():
+            chunks.append((idx, chunk.strip()))
+            idx += 1
+        i += chunk_tokens - overlap_tokens
+    return chunks
 
 def clean_markdown(text: str) -> str:
     """Strip navigation bars, footer link definitions, and tag/post lists from scraped markdown."""
@@ -108,13 +86,8 @@ def extract_relevant_content(text: str, query: str, max_tokens: int = 1500) -> s
         return text[:max_tokens * 4]
 
     # Tokenize the entire text once
-    try:
-        encoding = tiktoken.get_encoding("cl100k_base")
-        tokens = encoding.encode(text, disallowed_special=())
-    except Exception:
-        # Fallback if tiktoken is not available
-        encoding = None
-        tokens = text.split()
+    encoding = tiktoken.get_encoding("cl100k_base")
+    tokens = encoding.encode(text, disallowed_special=())
 
     chunk_tokens = 200
     overlap_tokens = 40
@@ -132,10 +105,7 @@ def extract_relevant_content(text: str, query: str, max_tokens: int = 1500) -> s
     valid_ranges = []
     valid_chunks = []
     for start, end in ranges:
-        if encoding:
-            chunk = encoding.decode(cast(list[int], tokens)[start:end]).strip()
-        else:
-            chunk = " ".join(cast(list[str], tokens)[start:end]).strip()
+        chunk = encoding.decode(tokens[start:end]).strip()
             
         if not chunk or is_junk_paragraph(chunk):
             continue
@@ -160,17 +130,9 @@ def extract_relevant_content(text: str, query: str, max_tokens: int = 1500) -> s
     
     candidates = [valid_chunks[i] for i in top_indices]
     candidate_ranges = [valid_ranges[i] for i in top_indices]
-    candidate_cosine_scores = [cosine_scores[i] for i in top_indices]
 
     # Step 2: Accurate Re-ranking using Cross-Encoder
-    if reranker is not None:
-        try:
-            cross_scores = list(reranker.rerank(query, candidates))
-        except Exception as e:
-            print(f"Warning: Reranking failed ({e}), falling back to Bi-Encoder scores.")
-            cross_scores = candidate_cosine_scores
-    else:
-        cross_scores = candidate_cosine_scores
+    cross_scores = list(reranker.rerank(query, candidates))
 
     # Pair scores with ranges and sort by score descending
     scored_candidates = []
@@ -230,10 +192,7 @@ def extract_relevant_content(text: str, query: str, max_tokens: int = 1500) -> s
     # 3. Decode only the merged ranges
     extracted_parts = []
     for start, end in merged_ranges:
-        if encoding:
-            part = encoding.decode(cast(list[int], tokens)[start:end]).strip()
-        else:
-            part = " ".join(cast(list[str], tokens)[start:end]).strip()
+        part = encoding.decode(tokens[start:end]).strip()
         if part:
             extracted_parts.append(part)
             
