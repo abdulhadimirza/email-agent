@@ -13,3 +13,17 @@ dependencies = [
     "pydantic>=2.12.5",
     "python-dotenv>=1.2.2",
 ]
+
+[tool.pyrefly]
+search_path = ["."]
+project-includes = [
+    "**/*.py*",
+    "**/*.ipynb",
+]
+project-excludes = [
+    "crewAI/**",
+    "ddgs/**",
+    "chainlit/**",
+]
+
+

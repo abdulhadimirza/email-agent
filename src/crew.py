@@ -4,13 +4,13 @@ from crewai import Agent
 from crewai.flow.flow import Flow, listen, start
 from ddgs import DDGS
 
-from src.utils import clean_markdown, extract_relevant_content
-from src.llm_config import get_groq_llm
+from .utils import clean_markdown, extract_relevant_content
+from .llm_config import get_groq_llm
 
 # Workaround for CrewAI injecting cache_breakpoint on unsupported models
 try:
     import crewai.llms.cache as _crewai_cache
-    _crewai_cache.mark_cache_breakpoint = lambda msg: msg
+    _crewai_cache.mark_cache_breakpoint = lambda message: message
 except ImportError:
     pass
 
@@ -75,12 +75,16 @@ class ResearchFlow(Flow[ResearchState]):
                 url = url.strip().rstrip(')').rstrip('.')
                 with DDGS() as ddgs:
                     res = ddgs.extract(url, fmt="text_markdown")
-                    content = res.get("content", "")
+                    content = res.get("content") or ""
+                    if isinstance(content, bytes):
+                        content = content.decode("utf-8", errors="ignore")
+                    elif not isinstance(content, str):
+                        content = str(content)
                     
                     # Instead of truncating just at the start, extract relevant paragraphs
                     if content:
                         cleaned_content = clean_markdown(content)
-                        truncated = extract_relevant_content(cleaned_content, self.state.query, max_chars=1500)
+                        truncated = extract_relevant_content(cleaned_content, self.state.query, max_tokens=1500)
                         scraped_entry = f"URL: {url}\nContent Snippet:\n{truncated}\n---"
                         self.state.scraped_data.append(scraped_entry)
                         print(f"\n=== SCRAPED DATA FROM {url} ===\n{truncated}\n================================\n")
@@ -123,11 +127,11 @@ class ResearchFlow(Flow[ResearchState]):
         )
 
         result = writer.kickoff(prompt)
-        self.state.report = result.raw
+        self.state.report = getattr(result, "raw", str(result))
         return self.state.report
 
 def create_flow(user_query: str, step_callback_creator=None, status_callback=None) -> ResearchFlow:
-    flow = ResearchFlow()
+    flow = ResearchFlow(name="ResearchFlow")
     flow.state.query = user_query
     flow.step_callback_creator = step_callback_creator
     flow.status_callback = status_callback

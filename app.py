@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from src.crew import create_flow  # Local import of the flow setup
 from crewai.agents.parser import AgentAction, AgentFinish
 
+
 # Load environment variables
 load_dotenv()
 
@@ -16,7 +17,7 @@ def make_step_callback(agent_role: str):
             content = f"**Thought:** {step_output.thought}\n\n**Tool Input:** `{step_output.tool_input}`"
             if step_output.result:
                 # Truncate tool results if they are excessively long for UI display
-                res_str = str(step_output.result)
+                res_str = step_output.result
                 if len(res_str) > 2000:
                     res_str = res_str[:2000] + "\n\n...(truncated for display)..."
                 content += f"\n\n**Tool Output:**\n```markdown\n{res_str}\n```"
